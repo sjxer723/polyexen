@@ -13,7 +13,10 @@ use halo2_proofs::{
 };
 // use halo2_proofs::plonk::{Challenge as Halo2Challenge};
 use num_bigint::BigUint;
+use once_cell::sync::Lazy;
 use std::{collections::HashMap, fmt::Debug};
+
+pub static mut PARAMS: Lazy<Plaf> = Lazy::new(|| Plaf::default());
 
 /// Type that implements a halo2 circuit from a Plaf
 #[derive(Debug)]
@@ -21,6 +24,7 @@ pub struct PlafH2Circuit {
     pub plaf: Plaf,
     pub wit: Witness,
 }
+
 
 impl PlafH2Circuit {
     pub fn instance<F: PrimeField<Repr = [u8; 32]>>(&self) -> Vec<Vec<F>> {
@@ -322,7 +326,8 @@ impl<F: PrimeField<Repr = [u8; 32]>> Circuit<F> for PlafH2Circuit {
     }
 
     fn configure(_meta: &mut ConstraintSystem<F>) -> Self::Config {
-        unreachable!();
+        unsafe { Self::configure_with_params(_meta, PARAMS.clone()) }
+        // unreachable!();
     }
 
     fn synthesize(
