@@ -1,10 +1,13 @@
-use std::{hash::Hash, iter::Product, time::Instant, time::Duration, fs::read_to_string, env};
+use core::num;
+use std::{env, fs::read_to_string, hash::Hash, iter::Product, str::FromStr, time::{Duration, Instant}};
 
+use nom::Offset;
 use polyexen::expr;
+use regex::Regex;
 
 use ark_std::{end_timer, perf_trace::TimerInfo, start_timer, Zero};
 use halo2_proofs::{
-    dev::{cost::CircuitCost, MockProver},
+    dev::{cost::CircuitCost, metadata::Column, MockProver},
     halo2curves::{bn256::{Bn256, Fr, G1Affine, G2}, group::prime::PrimeGroup},
     plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit, ProvingKey, VerifyingKey},
     poly::{commitment::ParamsProver, kzg::{
@@ -61,6 +64,23 @@ fn parse_sexp_list(s: &Sexp) -> Vec<Sexp> {
     }
 }
 
+
+fn parse_sexp_to_column_offset(s: &Sexp, num_of_fixed: usize) -> (expr::Column, usize) {
+    if let Sexp::List(l) = s {
+        let kind_atom = parse_sexp_atom(&l[0]);
+        let kind_str = parse_atom_string(&kind_atom);
+        let offset_atom =  parse_sexp_atom(&l[1]);
+        let offset = parse_atom_i(&offset_atom);
+
+        if kind_str == "Witness" {
+            return (expr::Column { kind: ColumnKind::Witness, index: 0}, offset as usize);
+        } else {
+            return (expr::Column { kind: ColumnKind::Fixed, index: num_of_fixed - 1}, offset as usize);    
+        }
+    }   
+    (expr::Column {kind: ColumnKind::Witness, index: 0}, 0)
+}
+
 fn parse_sexp_expr(s: &Sexp, m: &mut HashMap<String, usize>) -> expr::Expr<expr::PlonkVar> {
     let ops = parse_sexp_list(s);
     let t = parse_atom_string(&parse_sexp_atom(&ops[0]));
@@ -99,23 +119,30 @@ fn parse_sexp_expr(s: &Sexp, m: &mut HashMap<String, usize>) -> expr::Expr<expr:
             rotation: 0,
         }));
     } else if t == "Ref" {
-        let rotation = parse_atom_i(&parse_sexp_atom(&ops[1]));
+        // let rotation = parse_atom_i(&parse_sexp_atom(&ops[1]));
+        // TODO: constant cell in polynomial gates
+        let column_offset = parse_sexp_to_column_offset(&ops[1], 0);
 
         return Expr::Var(Var::Query(ColumnQuery {
             column: expr::Column {
                 kind: ColumnKind::Witness,
                 index: 0,
             },
-            rotation: rotation as i32,
+            rotation: column_offset.1 as i32,
         }));
     } else if t == "Const" {
-        let num = parse_atom_i(&parse_sexp_atom(&ops[1]));
-
-        return Expr::Const(BigUint::from(num as u128));
+        let mut num = BigUint::zero();
+        let s = parse_atom_string(&parse_sexp_atom(&ops[1]));
+        
+        if let Ok(n) = BigUint::from_str(&s.as_str()[1..]){
+            num = n;
+        }
+        return Expr::Const(num);
     }
 
     Expr::Const(BigUint::zero())
 }
+
 
 #[warn(unused_assignments)]
 fn parse_plaf_field(
@@ -133,16 +160,25 @@ fn parse_plaf_field(
     let mut k = 0;
     let mut columns_witness = vec![];
     let mut columns_fixed = vec![];
-    let mut offsets = vec![];
+    let mut wit_wit_offsets = vec![];
+    let mut wit_const_offsets = vec![];
     let mut s_locs = vec![];
     let mut locs = vec![];
     let mut fixed_values_loc = vec![];
     let mut fixed_value_col = vec![];
-    let mut witness_value_col = vec![];
+    let mut witness_value_col = vec![Some(BigUint::zero()); plaf.info.num_rows];;
     let mut fixed_values = vec![];
+    let mut row_idx = 0;
     let mut witness_values = vec![];
     let mut polys = vec![];
+    let mut copy_gate_column_0 = expr::Column {kind: ColumnKind::Witness, index: 0};
+    let mut copy_gate_column_1 = expr::Column {kind: ColumnKind::Witness, index: 0};
+    let mut copy_offset0 = 0;
+    let mut copy_offset1 = 0;
+    let mut constants = vec![Some(BigUint::zero()); plaf.info.num_rows];
 
+
+    println!("{:#?}", s.as_str());
     match s.as_str() {
         "col" => {
             for v in &kvs[1..] {
@@ -169,12 +205,16 @@ fn parse_plaf_field(
                         _ => {}
                     }
                 }
+                columns_fixed.push(ColumnFixed::new(String::from("Constant")))
             }
             _ => {}
         },
         "polynomial_gates" => match &kvs[1] {
             Sexp::List(gates) => {
                 for (_idx, _gate) in gates.iter().enumerate() {
+                    // if (_idx >= 1) {
+                    //     break;
+                    // }
                     polys.push(Poly {
                         name: String::from(format!("gate{}", _idx)),
                         exp: parse_sexp_expr(_gate, selector_index),
@@ -186,10 +226,14 @@ fn parse_plaf_field(
         "copy_gates" => match &kvs[1] {
             Sexp::List(cps) => {
                 for cp in cps {
-                    offsets.push((
-                        parse_atom_i(&parse_sexp_atom(&parse_sexp_list(cp)[0])) as usize,
-                        parse_atom_i(&parse_sexp_atom(&parse_sexp_list(cp)[1])) as usize,
-                    ))
+                    (copy_gate_column_0, copy_offset0) = parse_sexp_to_column_offset(&parse_sexp_list(cp)[0], plaf.columns.fixed.len());
+                    (copy_gate_column_1, copy_offset1) = parse_sexp_to_column_offset(&parse_sexp_list(cp)[1], plaf.columns.fixed.len());
+                    
+                    if copy_gate_column_0.kind == expr::ColumnKind::Witness && copy_gate_column_1.kind == expr::ColumnKind::Witness {
+                        wit_wit_offsets.push((copy_offset0, copy_offset1));
+                    } else {
+                        wit_const_offsets.push((copy_offset0, copy_offset1));
+                    }
                 }
             }
             _ => {}
@@ -211,16 +255,35 @@ fn parse_plaf_field(
             match &kvs[1] {
                 Sexp::List(wvs) => {
                     for _wv in wvs {
-                        witness_value_col
-                            .push(Some(BigUint::from(parse_atom_i(&parse_sexp_atom(
-                                &parse_sexp_list(_wv)[1],
-                            )) as u128)))
+                        row_idx = parse_atom_i(&parse_sexp_atom(&parse_sexp_list(_wv)[0]));
+                        if let Ok(n) = BigUint::from_str(
+                            &parse_atom_string(
+                                &parse_sexp_atom(&parse_sexp_list(_wv)[1])
+                            ).as_str()[1..]) {
+                            witness_value_col[row_idx as usize]= Some(n)
+                        }
                     }
                 }
                 _ => {}
             }
             witness_values.push(witness_value_col)
+        },
+        "constants" => {
+            match &kvs[1] {
+                Sexp::List(wvs) => {
+                    for (i,_wv) in wvs.iter().enumerate() {
+                        if let Ok(n) = BigUint::from_str(
+                            &parse_atom_string(
+                                &parse_sexp_atom(&parse_sexp_list(_wv)[1])
+                            ).as_str()[1..]) {
+                            constants[i] = Some(n)
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
+
         _ => println!("The string is something else"),
     }
 
@@ -235,7 +298,9 @@ fn parse_plaf_field(
             wit.num_rows = k;
         }
         "polynomial_gates" => plaf.polys = polys,
-        "selectors" => plaf.columns.fixed = columns_fixed,
+        "selectors" => {
+            plaf.columns.fixed = columns_fixed;
+        }
         "selector_values" => {
             for loc_col in fixed_values_loc {
                 fixed_value_col = vec![Some(BigUint::from(0 as u8)); plaf.info.num_rows];
@@ -247,22 +312,22 @@ fn parse_plaf_field(
             plaf.fixed = fixed_values;
         }
         "copy_gates" => {
-            plaf.copys = vec![CopyC {
-                columns: (
-                    expr::Column {
-                        kind: ColumnKind::Witness,
-                        index: 0,
-                    },
-                    expr::Column {
-                        kind: ColumnKind::Witness,
-                        index: 0,
-                    },
-                ),
-                offsets: offsets,
-            }]
+            plaf.copys = vec![
+                CopyC {
+                    columns: (expr::Column {kind: ColumnKind::Witness, index: 0}, expr::Column {kind: ColumnKind::Witness, index: 0}),
+                    offsets: wit_wit_offsets,
+                },
+                CopyC {
+                    columns: (expr::Column {kind: ColumnKind::Witness, index: 0}, expr::Column {kind: ColumnKind::Fixed, index: plaf.columns.fixed.len() - 1}),
+                    offsets: wit_const_offsets,
+                }
+            ]
         }
         "witness_values" => {
             wit.witness = witness_values;
+        }
+        "constants" => {
+            plaf.fixed.push(constants);
         }
         _ => {}
     }
@@ -352,10 +417,9 @@ pub fn check_proof(
     check_proof_with_instances(params, vk, proof, &[], expect_satisfied);
 }
 
-
 #[derive(Debug)]
 struct Cost <G: PrimeGroup, PlafH2Circuit: Circuit<G::Scalar>>{
-    mockprover_verified: bool,
+    // mockprover_verified: bool,
     // Circuit cost
     circuit_cost: CircuitCost::<G, PlafH2Circuit>,
     // Time cost
@@ -413,9 +477,13 @@ fn main() {
     //     },
     //     _ => {}
     // };
-    println!("{:?}", wit.witness[0][3]);
-    println!("{:#?}", plaf);
-    println!("{:#?}", wit);
+    // println!("{:?}", wit.witness[0][3]);
+    // println!("{:#?}", plaf);
+    for (i, v) in wit.witness[0].iter().enumerate() {
+        println!("{:#?}: {:#?}", i,v.clone().as_mut().unwrap());
+    }
+    // println!("{:#?}", wit.witness);
+    println!("{:#?}", plaf.copys );
 
     let k = ((plaf.info.num_rows as f32).log2().ceil() + (1 as f32)) as u32;
     let plaf_circuit = PlafH2Circuit {
@@ -458,7 +526,7 @@ fn main() {
     let verify_time = verify_start_time.elapsed();
     
     let cost = Cost {
-        mockprover_verified: true,
+        // mockprover_verified: true,
         circuit_cost: circuit_cost,
         pk_time: pk_time.as_secs_f64(),
         vk_time: vk_time.as_secs_f64(),
@@ -467,5 +535,27 @@ fn main() {
         verify_time: verify_time.as_secs_f64(),
     };
     
-    println!("{:#?}", cost);
+    let cost_data = format!("{:#?}", cost);
+
+    let filtered_data: Vec<&str> = cost_data
+        .lines()
+        .filter(|line| !line.contains("_marker"))
+        .collect();
+
+    let filtered_data = filtered_data.join("\n");
+
+    let re = Regex::new(r"[-+]?\d*\.\d+|\d+").unwrap();
+    let numbers: Vec<&str> = re.find_iter(&filtered_data).map(|mat| mat.as_str()).collect();
+
+    for num in &numbers {
+        if num.contains('.') {
+            if let Ok(parsed_num) = num.parse::<f64>() {
+                println!("{}", parsed_num);
+            }
+        } else {
+            if let Ok(parsed_num) = num.parse::<i64>() {
+                println!("{}", parsed_num);
+            }
+        }
+    }
 }
