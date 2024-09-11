@@ -293,10 +293,10 @@ fn parse_plaf_field(
             plaf.columns.witness = columns_witness.clone();
             wit.columns = columns_witness.clone();
         }
-        "k" => {
-            plaf.info.num_rows = k;
-            wit.num_rows = k;
-        }
+        // "k" => {
+        //     plaf.info.num_rows = k;
+        //     wit.num_rows = k;
+        // }
         "polynomial_gates" => plaf.polys = polys,
         "selectors" => {
             plaf.columns.fixed = columns_fixed;
@@ -333,9 +333,44 @@ fn parse_plaf_field(
     }
 }
 
+
+fn get_length_of_witness(s: &Sexp) -> i64{
+    use core::cmp::max;
+
+    let mut row_idx = 0;
+    let mut length = 0;
+    match s{
+        Sexp::List(wvs) => {
+            for _wv in wvs {
+                row_idx = parse_atom_i(&parse_sexp_atom(&parse_sexp_list(_wv)[0]));
+                length = max(length, row_idx);
+            }
+        }
+        _ => {}
+    }
+    return length;
+}
+
+fn set_plaf_num_rows(l: Vec<Sexp>, plaf: &mut Plaf, wit: &mut Witness) {
+    for s in l {
+        if let Sexp::List(kvs) = s {
+            match &kvs[0] {
+                Sexp::Atom(a) => {
+                    if parse_atom_string(a) == "witness_values" {
+                        plaf.info.num_rows = get_length_of_witness(&kvs[1]) as usize + 2;
+                        wit.num_rows = get_length_of_witness(&kvs[1]) as usize + 2;
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
 fn parse_plaf_field_list(l: Vec<Sexp>, plaf: &mut Plaf, wit: &mut Witness) {
     let mut selector_index: HashMap<String, usize> = HashMap::new();
 
+    set_plaf_num_rows(l.clone(), plaf, wit);
     for s in l {
         if let Sexp::List(kvs) = s {
             match &kvs[0] {
