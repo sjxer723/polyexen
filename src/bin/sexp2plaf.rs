@@ -3,6 +3,7 @@ use std::{env, fs::read_to_string, hash::Hash, iter::Product, str::FromStr, time
 
 use nom::Offset;
 use polyexen::expr;
+use rand_chacha::rand_core::le;
 use regex::Regex;
 
 use ark_std::{end_timer, perf_trace::TimerInfo, start_timer, Zero};
@@ -65,17 +66,20 @@ fn parse_sexp_list(s: &Sexp) -> Vec<Sexp> {
 }
 
 
-fn parse_sexp_to_column_offset(s: &Sexp, num_of_fixed: usize) -> (expr::Column, usize) {
+fn parse_sexp_to_column_offset(s: &Sexp, num_of_fixed: usize, m: &mut HashMap<String, usize>) -> (expr::Column, usize) {
     if let Sexp::List(l) = s {
-        let kind_atom = parse_sexp_atom(&l[0]);
-        let kind_str = parse_atom_string(&kind_atom);
         let offset_atom =  parse_sexp_atom(&l[1]);
         let offset = parse_atom_i(&offset_atom);
-
-        if kind_str == "Witness" {
-            return (expr::Column { kind: ColumnKind::Witness, index: 0}, offset as usize);
-        } else {
-            return (expr::Column { kind: ColumnKind::Fixed, index: num_of_fixed - 1}, offset as usize);    
+        let mut fixed_column_str = String::from("");
+        
+        return match l[0].clone() {
+            Sexp::Atom(_) => 
+                (expr::Column { kind: ColumnKind::Witness, index: 0}, offset as usize),
+            Sexp::List(l) => {
+                fixed_column_str =  parse_atom_string(&parse_sexp_atom(&l[1]));
+                (expr::Column { kind: ColumnKind::Fixed, 
+                    index: m.get(&fixed_column_str).unwrap().clone()}, offset as usize)
+            } 
         }
     }   
     (expr::Column {kind: ColumnKind::Witness, index: 0}, 0)
@@ -108,26 +112,13 @@ fn parse_sexp_expr(s: &Sexp, m: &mut HashMap<String, usize>) -> expr::Expr<expr:
             }
             _ => {}
         }
-    } else if t == "Selector" {
-        let name = parse_atom_string(&parse_sexp_atom(&ops[1]));
-
-        return Expr::Var(Var::Query(ColumnQuery {
-            column: expr::Column {
-                kind: ColumnKind::Fixed,
-                index: m.get(&name).unwrap().clone(),
-            },
-            rotation: 0,
-        }));
     } else if t == "Ref" {
         // let rotation = parse_atom_i(&parse_sexp_atom(&ops[1]));
         // TODO: constant cell in polynomial gates
-        let column_offset = parse_sexp_to_column_offset(&ops[1], 0);
+        let column_offset = parse_sexp_to_column_offset(&ops[1], 0, m);
 
         return Expr::Var(Var::Query(ColumnQuery {
-            column: expr::Column {
-                kind: ColumnKind::Witness,
-                index: 0,
-            },
+            column: column_offset.0,
             rotation: column_offset.1 as i32,
         }));
     } else if t == "Const" {
@@ -144,6 +135,80 @@ fn parse_sexp_expr(s: &Sexp, m: &mut HashMap<String, usize>) -> expr::Expr<expr:
 }
 
 
+// l is a list of sexp and contains the following two kind of sexp
+// * ((Witness row_index) value)
+// * ((Fixed column_str) row_index) value)
+fn parse_values(l: &Vec<Sexp>, row_num: usize, map: &mut HashMap<String, usize>)
+    -> (Vec<Option<BigUint>>, Vec<Vec<Option<BigUint>>>) {
+    let mut witness_values: Vec<Option<BigUint>> = vec![None; row_num];
+    let mut fixed_columns_values: Vec<Vec<Option<BigUint>>> = vec![];    
+    let mut column_name_with_idx;
+    let mut val = None;
+    let mut fixed_column_name;
+    let mut row_idx = 0;
+
+    for _ in map.keys() {
+        fixed_columns_values.insert(0, vec![None; row_num]);
+    }
+
+    for s in l {
+        match s {
+            Sexp::Atom(_) => unreachable!(),
+            Sexp::List(elements) => {
+                if let Ok(n) = BigUint::from_str(
+                    &parse_atom_string(&parse_sexp_atom(&elements[1])).as_str()[1..]) {
+                    val = Some(n);
+                }
+                column_name_with_idx = parse_sexp_list(&elements[0]);
+                match column_name_with_idx[0].clone() {
+                    // fixed column
+                    Sexp::List(fixed_with_name) => {
+                        fixed_column_name = parse_atom_string(
+                            &parse_sexp_atom(&fixed_with_name[1]));
+                        row_idx = parse_atom_i(
+                            &parse_sexp_atom(&column_name_with_idx[1])) as usize;
+                        fixed_columns_values[map.get(&fixed_column_name).unwrap().clone()][row_idx] = 
+                            val.clone();
+                    },
+                    // witness column
+                    Sexp::Atom(_) => {
+                        // println!("{:#?}", witness_values);
+                        witness_values[parse_atom_i(
+                            &parse_sexp_atom(&column_name_with_idx[1])) as usize] = val.clone();
+                    },
+                }
+            }
+        }
+    }
+    return (witness_values, fixed_columns_values)
+
+}
+
+// l is a list of sexp and contains the following two kind of sexp
+// * ((Witness row_index) value)
+// * ((Fixed column_str) row_index) value)
+fn get_num_of_row(l: &Vec<Sexp>)
+    -> usize {
+    let mut length = 0;
+    let mut column_name_with_idx;
+    
+    for s in l {
+        match s {
+            Sexp::Atom(_) => unreachable!(),
+            Sexp::List(elements) => {
+                column_name_with_idx = parse_sexp_list(&elements[0]);
+                match column_name_with_idx[0].clone() {
+                    // fixed column
+                    Sexp::List(_) => {},
+                    // witness column
+                    Sexp::Atom(_) => {length +=1;},
+                }
+            }
+        }
+    }
+    return length;
+}
+
 #[warn(unused_assignments)]
 fn parse_plaf_field(
     a: &Atom,
@@ -157,16 +222,15 @@ fn parse_plaf_field(
         _ => String::from(""),
     };
 
-    let mut k = 0;
-    let mut columns_witness = vec![];
+    let mut fixed_column_sexp = Sexp::Atom(Atom::S(String::from("")));
     let mut columns_fixed = vec![];
     let mut wit_wit_offsets = vec![];
     let mut wit_const_offsets = vec![];
-    let mut s_locs = vec![];
-    let mut locs = vec![];
-    let mut fixed_values_loc = vec![];
-    let mut fixed_value_col = vec![];
-    let mut witness_value_col = vec![Some(BigUint::zero()); plaf.info.num_rows];;
+    // let mut s_locs = vec![];
+    // let mut locs = vec![];
+    // let mut fixed_values_loc = vec![];
+    // let mut fixed_value_col = vec![];
+    let mut witness_value_col = vec![Some(BigUint::zero()); plaf.info.num_rows];
     let mut fixed_values = vec![];
     let mut row_idx = 0;
     let mut witness_values = vec![];
@@ -180,32 +244,23 @@ fn parse_plaf_field(
 
     println!("{:#?}", s.as_str());
     match s.as_str() {
-        "col" => {
-            for v in &kvs[1..] {
-                match v {
-                    Sexp::Atom(a1) => {
-                        columns_witness.push(ColumnWitness::new(parse_atom_string(&a1), 0))
-                    }
-                    _ => {}
-                }
-            }
-        }
-        "k" => match &kvs[1] {
-            Sexp::Atom(a1) => k = parse_atom_i(&a1) as usize,
+        "num_rows" => match &kvs[1] {
+            Sexp::Atom(a1) => plaf.info.num_rows = parse_atom_i(&a1) as usize,
             _ => {}
         },
-        "selectors" => match &kvs[1] {
+        "fixed_columns" => match &kvs[1] {
             Sexp::List(l) => {
-                for (index, selector) in l.iter().enumerate() {
-                    match selector {
+                for (index, fixed_column) in l.iter().enumerate() {
+                    fixed_column_sexp = parse_sexp_list(fixed_column)[1].clone();
+                    match fixed_column_sexp {
                         Sexp::Atom(_selector) => {
-                            selector_index.insert(parse_atom_string(_selector), index);
-                            columns_fixed.push(ColumnFixed::new(parse_atom_string(_selector)))
+                            selector_index.insert(parse_atom_string(&_selector), index);
+                            columns_fixed.push(ColumnFixed::new(parse_atom_string(&_selector)))
                         }
                         _ => {}
                     }
                 }
-                columns_fixed.push(ColumnFixed::new(String::from("Constant")))
+                // columns_fixed.push(ColumnFixed::new(String::from("Constant")))
             }
             _ => {}
         },
@@ -226,8 +281,8 @@ fn parse_plaf_field(
         "copy_gates" => match &kvs[1] {
             Sexp::List(cps) => {
                 for cp in cps {
-                    (copy_gate_column_0, copy_offset0) = parse_sexp_to_column_offset(&parse_sexp_list(cp)[0], plaf.columns.fixed.len());
-                    (copy_gate_column_1, copy_offset1) = parse_sexp_to_column_offset(&parse_sexp_list(cp)[1], plaf.columns.fixed.len());
+                    (copy_gate_column_0, copy_offset0) = parse_sexp_to_column_offset(&parse_sexp_list(cp)[0], plaf.columns.fixed.len(), selector_index);
+                    (copy_gate_column_1, copy_offset1) = parse_sexp_to_column_offset(&parse_sexp_list(cp)[1], plaf.columns.fixed.len(), selector_index);
                     
                     if copy_gate_column_0.kind == expr::ColumnKind::Witness && copy_gate_column_1.kind == expr::ColumnKind::Witness {
                         wit_wit_offsets.push((copy_offset0, copy_offset1));
@@ -238,127 +293,98 @@ fn parse_plaf_field(
             }
             _ => {}
         },
-        "selector_values" => match &kvs[1] {
-            Sexp::List(svs) => {
-                for _sv in svs {
-                    s_locs = parse_sexp_list(_sv);
-                    locs = vec![];
-                    for _v in parse_sexp_list(&s_locs[1]) {
-                        locs.push(parse_atom_i(&parse_sexp_atom(&_v)) as u64);
-                    }
-                    fixed_values_loc.push(locs.clone())
-                }
-            }
-            _ => {}
-        },
-        "witness_values" => {
+        // "selector_values" => match &kvs[1] {
+        //     Sexp::List(svs) => {
+        //         for _sv in svs {
+        //             s_locs = parse_sexp_list(_sv);
+        //             locs = vec![];
+        //             for _v in parse_sexp_list(&s_locs[1]) {
+        //                 locs.push(parse_atom_i(&parse_sexp_atom(&_v)) as u64);
+        //             }
+        //             fixed_values_loc.push(locs.clone())
+        //         }
+        //     }
+        //     _ => {}
+        // },
+        "values" => {
             match &kvs[1] {
                 Sexp::List(wvs) => {
-                    for _wv in wvs {
-                        row_idx = parse_atom_i(&parse_sexp_atom(&parse_sexp_list(_wv)[0]));
-                        if let Ok(n) = BigUint::from_str(
-                            &parse_atom_string(
-                                &parse_sexp_atom(&parse_sexp_list(_wv)[1])
-                            ).as_str()[1..]) {
-                            witness_value_col[row_idx as usize]= Some(n)
-                        }
-                    }
-                }
-                _ => {}
-            }
-            witness_values.push(witness_value_col)
-        },
-        "constants" => {
-            match &kvs[1] {
-                Sexp::List(wvs) => {
-                    for (i,_wv) in wvs.iter().enumerate() {
-                        if let Ok(n) = BigUint::from_str(
-                            &parse_atom_string(
-                                &parse_sexp_atom(&parse_sexp_list(_wv)[1])
-                            ).as_str()[1..]) {
-                            constants[i] = Some(n)
-                        }
-                    }
+                    (witness_values, fixed_values) = parse_values(wvs, plaf.info.num_rows, selector_index);
                 }
                 _ => {}
             }
         }
+        // "constants" => {
+        //     match &kvs[1] {
+        //         Sexp::List(wvs) => {
+        //             for (i,_wv) in wvs.iter().enumerate() {
+        //                 if let Ok(n) = BigUint::from_str(
+        //                     &parse_atom_string(
+        //                         &parse_sexp_atom(&parse_sexp_list(_wv)[1])
+        //                     ).as_str()[1..]) {
+        //                     constants[i] = Some(n)
+        //                 }
+        //             }
+        //         }
+        //         _ => {}
+        //     }
+        // }
 
-        _ => println!("The string is something else"),
+        _ => println!("The {:#?} is something else", s.as_str()),
     }
 
     // Update plaf
     match s.as_str() {
-        "col" => {
-            plaf.columns.witness = columns_witness.clone();
-            wit.columns = columns_witness.clone();
-        }
-        // "k" => {
-        //     plaf.info.num_rows = k;
-        //     wit.num_rows = k;
-        // }
         "polynomial_gates" => plaf.polys = polys,
-        "selectors" => {
+        "fixed_columns" => {
             plaf.columns.fixed = columns_fixed;
         }
-        "selector_values" => {
-            for loc_col in fixed_values_loc {
-                fixed_value_col = vec![Some(BigUint::from(0 as u8)); plaf.info.num_rows];
-                for _loc in loc_col {
-                    fixed_value_col[_loc as usize] = Some(BigUint::from(1 as u8));
-                }
-                fixed_values.push(fixed_value_col)
-            }
+        "values" => {
+            // for loc_col in fixed_values_loc {
+            //     fixed_value_col = vec![Some(BigUint::from(0 as u8)); plaf.info.num_rows];
+            //     for _loc in loc_col {
+            //         fixed_value_col[_loc as usize] = Some(BigUint::from(1 as u8));
+            //     }
+            //     fixed_values.push(fixed_value_col)
+            // }
             plaf.fixed = fixed_values;
+            // TODO: support multiple witness columns
+            wit.witness = vec![witness_values];
         }
-        "copy_gates" => {
-            plaf.copys = vec![
-                CopyC {
-                    columns: (expr::Column {kind: ColumnKind::Witness, index: 0}, expr::Column {kind: ColumnKind::Witness, index: 0}),
-                    offsets: wit_wit_offsets,
-                },
-                CopyC {
-                    columns: (expr::Column {kind: ColumnKind::Witness, index: 0}, expr::Column {kind: ColumnKind::Fixed, index: plaf.columns.fixed.len() - 1}),
-                    offsets: wit_const_offsets,
-                }
-            ]
-        }
-        "witness_values" => {
-            wit.witness = witness_values;
-        }
-        "constants" => {
-            plaf.fixed.push(constants);
-        }
+        // "copy_gates" => {
+        //     plaf.copys = vec![
+        //         CopyC {
+        //             columns: (expr::Column {kind: ColumnKind::Witness, index: 0}, expr::Column {kind: ColumnKind::Witness, index: 0}),
+        //             offsets: wit_wit_offsets,
+        //         },
+        //         // CopyC {
+        //         //     columns: (expr::Column {kind: ColumnKind::Witness, index: 0}, expr::Column {kind: ColumnKind::Fixed, index: plaf.columns.fixed.len() - 1}),
+        //         //     offsets: wit_const_offsets,
+        //         // }
+        //     ]
+        // }
+        // "witness_values" => {
+        //     wit.witness = witness_values;
+        // }
+        // "constants" => {
+        //     plaf.fixed.push(constants);
+        // }
         _ => {}
     }
 }
 
-
-fn get_length_of_witness(s: &Sexp) -> i64{
-    use core::cmp::max;
-
-    let mut row_idx = 0;
-    let mut length = 0;
-    match s{
-        Sexp::List(wvs) => {
-            for _wv in wvs {
-                row_idx = parse_atom_i(&parse_sexp_atom(&parse_sexp_list(_wv)[0]));
-                length = max(length, row_idx);
-            }
-        }
-        _ => {}
-    }
-    return length;
-}
 
 fn set_plaf_num_rows(l: Vec<Sexp>, plaf: &mut Plaf, wit: &mut Witness) {
+    let mut length = 0;
+
     for s in l {
         if let Sexp::List(kvs) = s {
             match &kvs[0] {
                 Sexp::Atom(a) => {
-                    if parse_atom_string(a) == "witness_values" {
-                        plaf.info.num_rows = get_length_of_witness(&kvs[1]) as usize + 2;
-                        wit.num_rows = get_length_of_witness(&kvs[1]) as usize + 2;
+                    if parse_atom_string(a) == "values" {
+                        length = get_num_of_row(&parse_sexp_list(&kvs[1])) as usize;
+                        plaf.info.num_rows = length;
+                        wit.num_rows = length;
                     }
                 }
                 _ => unreachable!(),
@@ -369,8 +395,13 @@ fn set_plaf_num_rows(l: Vec<Sexp>, plaf: &mut Plaf, wit: &mut Witness) {
 
 fn parse_plaf_field_list(l: Vec<Sexp>, plaf: &mut Plaf, wit: &mut Witness) {
     let mut selector_index: HashMap<String, usize> = HashMap::new();
+    let mut columns_witness = vec![];
 
     set_plaf_num_rows(l.clone(), plaf, wit);
+    // TODO: only consider single witness column currently
+    columns_witness.push(ColumnWitness::new(String::from("w"), 0));
+    wit.columns = columns_witness.clone();
+    plaf.columns.witness = columns_witness;
     for s in l {
         if let Sexp::List(kvs) = s {
             match &kvs[0] {
@@ -512,13 +543,20 @@ fn main() {
     //     },
     //     _ => {}
     // };
-    // println!("{:?}", wit.witness[0][3]);
-    // println!("{:#?}", plaf);
-    for (i, v) in wit.witness[0].iter().enumerate() {
-        println!("{:#?}: {:#?}", i,v.clone().as_mut().unwrap());
-    }
-    // println!("{:#?}", wit.witness);
-    println!("{:#?}", plaf.copys );
+    // println!("{:?}", wit.witness[0].len());
+    // println!("{:#?}", plaf.polys);
+    // for (f_idx, f) in plaf.fixed.iter().enumerate() {
+    //     for (i, v) in f.iter().enumerate() {
+    //         match v.clone().as_mut() {
+    //             Some(v1) => {
+    //                 println!("{:#?}: {:#?}: {:#?}", f_idx, i,v.clone().as_mut().unwrap());
+    //             }
+    //             None => {}
+    //         }
+    //     }    
+    // }
+    // println!("{:#?}", plaf.fixed);
+    // println!("{:#?}", plaf.copys );
 
     let k = ((plaf.info.num_rows as f32).log2().ceil() + (1 as f32)) as u32;
     let plaf_circuit = PlafH2Circuit {
@@ -529,7 +567,9 @@ fn main() {
         *PARAMS = plaf.clone();
         // println!("{:#?}", &*PARAMS);
     }
-
+    // println!("{:#?}", plaf.info.num_rows);
+    // println!("{:#?}", plaf.columns.fixed.len());
+    // println!("{:#?}", plaf);
     let prover_plaf = MockProver::<Fr>::run(k, &plaf_circuit, Vec::new()).unwrap();
 
     let result_plaf = prover_plaf.verify();
