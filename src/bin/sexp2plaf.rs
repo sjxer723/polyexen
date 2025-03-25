@@ -1,8 +1,8 @@
 use core::num;
-use std::{env, fs::read_to_string, hash::Hash, iter::Product, str::FromStr, time::{Duration, Instant}};
+use std::{env, fs::read_to_string, hash::Hash, io::Read, iter::Product, str::FromStr, time::{Duration, Instant}};
 
 use nom::Offset;
-use polyexen::expr;
+use polyexen::{expr, plaf::ColumnPublic};
 use rand_chacha::rand_core::le;
 use regex::Regex;
 
@@ -72,17 +72,28 @@ fn parse_sexp_to_column_offset(s: &Sexp, num_of_fixed: usize, m: &mut HashMap<St
         let offset = parse_atom_i(&offset_atom);
         let mut fixed_column_str = String::from("");
         
-        return match l[0].clone() {
-            Sexp::Atom(_) => 
-                (expr::Column { kind: ColumnKind::Witness, index: 0}, offset as usize),
+        match l[0].clone() {
+            Sexp::Atom(a) => {
+                return match a {
+                    Atom::S(s) => {
+                        if s == "Witness" {
+                            (expr::Column { kind: ColumnKind::Witness, index: 0}, offset as usize)
+                        } else {
+                            (expr::Column { kind: ColumnKind::Public, index: 0}, offset as usize)
+                        }
+                    },
+                    _ => unreachable!()
+                }
+            } 
             Sexp::List(l) => {
                 fixed_column_str =  parse_atom_string(&parse_sexp_atom(&l[1]));
-                (expr::Column { kind: ColumnKind::Fixed, 
-                    index: m.get(&fixed_column_str).unwrap().clone()}, offset as usize)
+                return (expr::Column { kind: ColumnKind::Fixed, 
+                    index: m.get(&fixed_column_str).unwrap().clone()}, offset as usize);
             } 
         }
-    }   
-    (expr::Column {kind: ColumnKind::Witness, index: 0}, 0)
+    }  else {
+        unreachable!()
+    }
 }
 
 fn parse_sexp_expr(s: &Sexp, m: &mut HashMap<String, usize>) -> expr::Expr<expr::PlonkVar> {
@@ -139,8 +150,9 @@ fn parse_sexp_expr(s: &Sexp, m: &mut HashMap<String, usize>) -> expr::Expr<expr:
 // * ((Witness row_index) value)
 // * ((Fixed column_str) row_index) value)
 fn parse_values(l: &Vec<Sexp>, row_num: usize, map: &mut HashMap<String, usize>)
-    -> (Vec<Option<BigUint>>, Vec<Vec<Option<BigUint>>>) {
+    -> (Vec<Option<BigUint>>, Vec<Fr>, Vec<Vec<Option<BigUint>>>) {
     let mut witness_values: Vec<Option<BigUint>> = vec![None; row_num];
+    let mut instance_values: Vec<Fr> = vec![Fr::zero(); row_num];
     let mut fixed_columns_values: Vec<Vec<Option<BigUint>>> = vec![];    
     let mut column_name_with_idx;
     let mut val = None;
@@ -171,16 +183,34 @@ fn parse_values(l: &Vec<Sexp>, row_num: usize, map: &mut HashMap<String, usize>)
                             val.clone();
                     },
                     // witness column
-                    Sexp::Atom(_) => {
+                    Sexp::Atom(a) => {
+                        match a {
+                            Atom::S(s) => {
+                                if s == "Witness" {
+                                    // println!("witness column: {:#?}", s);
+                                    witness_values[parse_atom_i(
+                                        &parse_sexp_atom(&column_name_with_idx[1])) as usize] = val.clone();            
+                                } else if s == "Instance" {
+                                    // println!("fixed column: {:#?}", s);
+                                    println!("{:#?}", val.clone().unwrap().to_bytes_le());
+                                    let mut f_val: [u8; 32] = [0; 32];
+                                    let val_bytes = val.clone().unwrap().to_bytes_le();
+                                    for (i, _) in val_bytes.iter().enumerate() {
+                                        f_val[i] = val_bytes[i];
+                                    }
+                                    instance_values[parse_atom_i(
+                                        &parse_sexp_atom(&column_name_with_idx[1])) as usize] = Fr::from_bytes(&f_val).unwrap();
+                                }
+                            }
+                            _ => {}
+                        }
                         // println!("{:#?}", witness_values);
-                        witness_values[parse_atom_i(
-                            &parse_sexp_atom(&column_name_with_idx[1])) as usize] = val.clone();
                     },
                 }
             }
         }
     }
-    return (witness_values, fixed_columns_values)
+    return (witness_values, instance_values, fixed_columns_values)
 
 }
 
@@ -216,6 +246,7 @@ fn parse_plaf_field(
     selector_index: &mut HashMap<String, usize>,
     plaf: &mut Plaf,
     wit: &mut Witness,
+    instance: &mut Vec<Vec<Fr>>
 ) {
     let s = match a {
         Atom::S(s) => s.clone(),
@@ -224,17 +255,19 @@ fn parse_plaf_field(
 
     let mut fixed_column_sexp = Sexp::Atom(Atom::S(String::from("")));
     let mut columns_fixed = vec![];
-    let mut wit_wit_offsets = vec![];
-    let mut wit_const_offsets = vec![];
+    // let mut ins_witness_offsets = vec![];
+    // let mut wit_wit_offsets = vec![];
+    // let mut wit_const_offsets = vec![];
     let mut fixed_values = vec![];
     let mut witness_values = vec![];
+    let mut instance_values = vec![];
     let mut polys = vec![];
     let mut copy_gate_column_0 = expr::Column {kind: ColumnKind::Witness, index: 0};
     let mut copy_gate_column_1 = expr::Column {kind: ColumnKind::Witness, index: 0};
     let mut copy_offset0 = 0;
     let mut copy_offset1 = 0;
+    let instance_column = ColumnPublic::new(String::from("instance"));
     
-
     println!("{:#?}", s.as_str());
     match s.as_str() {
         "num_rows" => match &kvs[1] {
@@ -277,10 +310,12 @@ fn parse_plaf_field(
                     (copy_gate_column_0, copy_offset0) = parse_sexp_to_column_offset(&parse_sexp_list(cp)[0], plaf.columns.fixed.len(), selector_index);
                     (copy_gate_column_1, copy_offset1) = parse_sexp_to_column_offset(&parse_sexp_list(cp)[1], plaf.columns.fixed.len(), selector_index);
                     
-                    if copy_gate_column_0.kind == expr::ColumnKind::Witness && copy_gate_column_1.kind == expr::ColumnKind::Witness {
-                        wit_wit_offsets.push((copy_offset0, copy_offset1));
+                    if copy_gate_column_0.kind == expr::ColumnKind::Public && copy_gate_column_1.kind == expr::ColumnKind::Public {
+                        // ins_witness_offsets.push((copy_offset0, copy_offset1));
+                    } else if copy_gate_column_0.kind == expr::ColumnKind::Witness && copy_gate_column_1.kind == expr::ColumnKind::Witness {
+                        // wit_wit_offsets.push((copy_offset0, copy_offset1));
                     } else {
-                        wit_const_offsets.push((copy_gate_column_0, copy_gate_column_1, copy_offset0, copy_offset1));
+                        // wit_const_offsets.push((copy_gate_column_0, copy_gate_column_1, copy_offset0, copy_offset1));
                     }
                 }
             }
@@ -289,7 +324,7 @@ fn parse_plaf_field(
         "values" => {
             match &kvs[1] {
                 Sexp::List(wvs) => {
-                    (witness_values, fixed_values) = parse_values(wvs, plaf.info.num_rows, selector_index);
+                    (witness_values, instance_values, fixed_values) = parse_values(wvs, plaf.info.num_rows, selector_index);
                 }
                 _ => {}
             }
@@ -305,23 +340,25 @@ fn parse_plaf_field(
         }
         "values" => {
             plaf.fixed = fixed_values;
+            plaf.columns.public = vec![instance_column];
+            instance.push(instance_values);
             // TODO: support multiple witness columns
             wit.witness = vec![witness_values];
         }
         "copy_gates" => {
-            plaf.copys = vec![
-                CopyC {
-                    columns: (expr::Column {kind: ColumnKind::Witness, index: 0}, expr::Column {kind: ColumnKind::Witness, index: 0}),
-                    offsets: wit_wit_offsets,
-                }];
-            for (copy_gate_column_0, copy_gate_column_1, offset0, offset1) in wit_const_offsets.iter() {
-                plaf.copys.push(
-                    CopyC {
-                        columns: (copy_gate_column_0.clone(), copy_gate_column_1.clone()),
-                        offsets: vec![(*offset0, *offset1)],
-                    }
-                );
-            }
+            // plaf.copys = vec![
+            //     CopyC {
+            //         columns: (expr::Column {kind: ColumnKind::Witness, index: 0}, expr::Column {kind: ColumnKind::Witness, index: 0}),
+            //         offsets: wit_wit_offsets,
+            //     }];
+            // for (copy_gate_column_0, copy_gate_column_1, offset0, offset1) in wit_const_offsets.iter() {
+            //     plaf.copys.push(
+            //         CopyC {
+            //             columns: (copy_gate_column_0.clone(), copy_gate_column_1.clone()),
+            //             offsets: vec![(*offset0, *offset1)],
+            //         }
+            //     );
+            // }
         }
         _ => {}
     }
@@ -347,7 +384,7 @@ fn set_plaf_num_rows(l: Vec<Sexp>, plaf: &mut Plaf, wit: &mut Witness) {
     }
 }
 
-fn parse_plaf_field_list(l: Vec<Sexp>, plaf: &mut Plaf, wit: &mut Witness) {
+fn parse_plaf_field_list(l: Vec<Sexp>, plaf: &mut Plaf, wit: &mut Witness, instance: &mut Vec<Vec<Fr>>) {
     let mut selector_index: HashMap<String, usize> = HashMap::new();
     let mut columns_witness = vec![];
 
@@ -359,7 +396,7 @@ fn parse_plaf_field_list(l: Vec<Sexp>, plaf: &mut Plaf, wit: &mut Witness) {
     for s in l {
         if let Sexp::List(kvs) = s {
             match &kvs[0] {
-                Sexp::Atom(a) => parse_plaf_field(a, &kvs, &mut selector_index, plaf, wit),
+                Sexp::Atom(a) => parse_plaf_field(a, &kvs, &mut selector_index, plaf, wit, instance),
                 _ => unreachable!(),
             }
         }
@@ -394,8 +431,9 @@ pub fn gen_proof(
     params: &ParamsKZG<Bn256>,
     pk: &ProvingKey<G1Affine>,
     circuit: impl Circuit<Fr>,
+    instances: &[&[Fr]]
 ) -> Vec<u8> {
-    gen_proof_with_instances(params, pk, circuit, &[])
+    gen_proof_with_instances(params, pk, circuit, instances)
 }
 
 /// Helper function to verify a proof (generated using [`gen_proof_with_instances`]) using SHPLONK KZG multi-open polynomical commitment scheme
@@ -433,8 +471,9 @@ pub fn check_proof(
     vk: &VerifyingKey<G1Affine>,
     proof: &[u8],
     expect_satisfied: bool,
+    instances: &[&[Fr]]
 ) {
-    check_proof_with_instances(params, vk, proof, &[], expect_satisfied);
+    check_proof_with_instances(params, vk, proof, instances, expect_satisfied);
 }
 
 #[derive(Debug)]
@@ -482,10 +521,11 @@ fn main() {
         columns: vec![],
         witness: vec![],
     };
+    let mut instance: Vec<Vec<Fr>> = vec![];
     match parse(input.as_str()) {
         Ok(sexp) => match sexp {
             Sexp::Atom(_) => unreachable!(),
-            Sexp::List(l) => parse_plaf_field_list(l, &mut plaf, &mut wit),
+            Sexp::List(l) => parse_plaf_field_list(l, &mut plaf, &mut wit, &mut instance),
         },
         Err(e) => {
             eprintln!("Failed to parse S-expression: {:?}", e);
@@ -509,7 +549,7 @@ fn main() {
     //         }
     //     }    
     // }
-    // println!("{:#?}", plaf.fixed);
+    println!("{:#?}", plaf.fixed);
     // println!("{:#?}", plaf.copys );
 
     let k = ((plaf.info.num_rows as f32).log2().ceil() + (1 as f32)) as u32;
@@ -521,37 +561,37 @@ fn main() {
         *PARAMS = plaf.clone();
         // println!("{:#?}", &*PARAMS);
     }
-    // println!("{:#?}", plaf.info.num_rows);
-    // println!("{:#?}", plaf.columns.fixed.len());
-    // println!("{:#?}", plaf);
-    let prover_plaf = MockProver::<Fr>::run(k, &plaf_circuit, Vec::new()).unwrap();
+    let prover_plaf = MockProver::<Fr>::run(k, &plaf_circuit, instance.clone()).unwrap();
 
+    println!("run finished");
     let result_plaf = prover_plaf.verify();
     println!("result = {:#?}", result_plaf);
     let circuit_cost = CircuitCost::<G2, PlafH2Circuit>::measure(k, &plaf_circuit);
-    // println!("cost = {:#?}", circuit_cost);
+    println!("cost = {:#?}", circuit_cost);
 
     let params = fs::gen_srs(k);
 
-    // Generating vkey
+    // // Generating vkey
     let vk_start_time = Instant::now();
     let vk = keygen_vk(&params, &plaf_circuit).unwrap();
     let vk_time = vk_start_time.elapsed();
 
-    // Generating pkey
+    // // Generating pkey
     let pk_start_time = Instant::now();
     let pk = keygen_pk(&params, vk, &plaf_circuit).unwrap();
     let pk_time = pk_start_time.elapsed();
 
-    // Creating the proof
+    // // Creating the proof
     let proof_start_time = Instant::now();
-    let proof = gen_proof(&params, &pk, plaf_circuit);
+    let instance_slice = instance.iter().map(|v| v.as_slice()).collect::<Vec<_>>();
+    let instance = instance_slice.as_slice();
+    let proof = gen_proof(&params, &pk, plaf_circuit, instance);
     let proof_time = proof_start_time.elapsed();
     let proof_size = proof.len();
     
     // Verifying
     let verify_start_time = Instant::now();
-    check_proof(&params, pk.get_vk(), &proof, true);
+    check_proof(&params, pk.get_vk(), &proof,  true, instance);
     let verify_time = verify_start_time.elapsed();
     
     let cost = Cost {
