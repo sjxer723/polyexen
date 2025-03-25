@@ -226,21 +226,14 @@ fn parse_plaf_field(
     let mut columns_fixed = vec![];
     let mut wit_wit_offsets = vec![];
     let mut wit_const_offsets = vec![];
-    // let mut s_locs = vec![];
-    // let mut locs = vec![];
-    // let mut fixed_values_loc = vec![];
-    // let mut fixed_value_col = vec![];
-    let mut witness_value_col = vec![Some(BigUint::zero()); plaf.info.num_rows];
     let mut fixed_values = vec![];
-    let mut row_idx = 0;
     let mut witness_values = vec![];
     let mut polys = vec![];
     let mut copy_gate_column_0 = expr::Column {kind: ColumnKind::Witness, index: 0};
     let mut copy_gate_column_1 = expr::Column {kind: ColumnKind::Witness, index: 0};
     let mut copy_offset0 = 0;
     let mut copy_offset1 = 0;
-    let mut constants = vec![Some(BigUint::zero()); plaf.info.num_rows];
-
+    
 
     println!("{:#?}", s.as_str());
     match s.as_str() {
@@ -287,25 +280,12 @@ fn parse_plaf_field(
                     if copy_gate_column_0.kind == expr::ColumnKind::Witness && copy_gate_column_1.kind == expr::ColumnKind::Witness {
                         wit_wit_offsets.push((copy_offset0, copy_offset1));
                     } else {
-                        wit_const_offsets.push((copy_offset0, copy_offset1));
+                        wit_const_offsets.push((copy_gate_column_0, copy_gate_column_1, copy_offset0, copy_offset1));
                     }
                 }
             }
             _ => {}
         },
-        // "selector_values" => match &kvs[1] {
-        //     Sexp::List(svs) => {
-        //         for _sv in svs {
-        //             s_locs = parse_sexp_list(_sv);
-        //             locs = vec![];
-        //             for _v in parse_sexp_list(&s_locs[1]) {
-        //                 locs.push(parse_atom_i(&parse_sexp_atom(&_v)) as u64);
-        //             }
-        //             fixed_values_loc.push(locs.clone())
-        //         }
-        //     }
-        //     _ => {}
-        // },
         "values" => {
             match &kvs[1] {
                 Sexp::List(wvs) => {
@@ -314,22 +294,6 @@ fn parse_plaf_field(
                 _ => {}
             }
         }
-        // "constants" => {
-        //     match &kvs[1] {
-        //         Sexp::List(wvs) => {
-        //             for (i,_wv) in wvs.iter().enumerate() {
-        //                 if let Ok(n) = BigUint::from_str(
-        //                     &parse_atom_string(
-        //                         &parse_sexp_atom(&parse_sexp_list(_wv)[1])
-        //                     ).as_str()[1..]) {
-        //                     constants[i] = Some(n)
-        //                 }
-        //             }
-        //         }
-        //         _ => {}
-        //     }
-        // }
-
         _ => println!("The {:#?} is something else", s.as_str()),
     }
 
@@ -340,35 +304,25 @@ fn parse_plaf_field(
             plaf.columns.fixed = columns_fixed;
         }
         "values" => {
-            // for loc_col in fixed_values_loc {
-            //     fixed_value_col = vec![Some(BigUint::from(0 as u8)); plaf.info.num_rows];
-            //     for _loc in loc_col {
-            //         fixed_value_col[_loc as usize] = Some(BigUint::from(1 as u8));
-            //     }
-            //     fixed_values.push(fixed_value_col)
-            // }
             plaf.fixed = fixed_values;
             // TODO: support multiple witness columns
             wit.witness = vec![witness_values];
         }
-        // "copy_gates" => {
-        //     plaf.copys = vec![
-        //         CopyC {
-        //             columns: (expr::Column {kind: ColumnKind::Witness, index: 0}, expr::Column {kind: ColumnKind::Witness, index: 0}),
-        //             offsets: wit_wit_offsets,
-        //         },
-        //         // CopyC {
-        //         //     columns: (expr::Column {kind: ColumnKind::Witness, index: 0}, expr::Column {kind: ColumnKind::Fixed, index: plaf.columns.fixed.len() - 1}),
-        //         //     offsets: wit_const_offsets,
-        //         // }
-        //     ]
-        // }
-        // "witness_values" => {
-        //     wit.witness = witness_values;
-        // }
-        // "constants" => {
-        //     plaf.fixed.push(constants);
-        // }
+        "copy_gates" => {
+            plaf.copys = vec![
+                CopyC {
+                    columns: (expr::Column {kind: ColumnKind::Witness, index: 0}, expr::Column {kind: ColumnKind::Witness, index: 0}),
+                    offsets: wit_wit_offsets,
+                }];
+            for (copy_gate_column_0, copy_gate_column_1, offset0, offset1) in wit_const_offsets.iter() {
+                plaf.copys.push(
+                    CopyC {
+                        columns: (copy_gate_column_0.clone(), copy_gate_column_1.clone()),
+                        offsets: vec![(*offset0, *offset1)],
+                    }
+                );
+            }
+        }
         _ => {}
     }
 }
